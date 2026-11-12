@@ -1,0 +1,12 @@
+[package]
+name = "skillet"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# glow instead of the default wgpu backend: a fraction of the build size, plenty for a table UI.
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "clipboard"] }
+serde_json = "1"
+
+[profile.dev]
+debug = false
