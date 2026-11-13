@@ -49,7 +49,8 @@ fn adopt_shell_path() {
 fn main() -> eframe::Result {
     adopt_shell_path();
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1760.0, 980.0]).with_min_inner_size([1100.0, 600.0]),
+        // An empty icon stops eframe swapping its own default into the Dock, so the bundle's icon stays.
+        viewport: egui::ViewportBuilder::default().with_icon(egui::IconData::default()).with_inner_size([1760.0, 980.0]).with_min_inner_size([1100.0, 600.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -109,6 +110,7 @@ enum Msg {
     /// `relink`: a skill to link back into these harnesses once the job is done.
     Job { title: String, out: String, relink: Option<(String, Vec<usize>)> },
     Matches(Vec<(String, Vec<Hit>)>),
+    Text(Hit, Option<String>),
     Usage(Usage),
     Answer { skill: String, who: &'static str, text: String },
     Models(usize, Vec<(String, Vec<String>)>),
@@ -124,6 +126,32 @@ struct Hit {
     skill: String,
     name: String,
     installs: u64,
+    /// How much of its SKILL.md matches the local copy, 0-100. None until compared.
+    same: Option<u8>,
+}
+
+/// The SKILL.md a skills.sh result points at, read from its public GitHub repo.
+// ponytail: unauthenticated GitHub API, 60 repo listings an hour. Cache per repo if lookups get rate-limited.
+fn remote_md(source: &str, skill: &str) -> Option<String> {
+    let ok = |part: &str| !part.is_empty() && !part.starts_with('.') && part.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+    let (owner, repo) = source.split_once('/')?;
+    if !ok(owner) || !ok(repo) {
+        return None;
+    }
+    let get = |url: String| {
+        let out = Command::new("curl").args(["-fsSL", "-m", "15"]).arg(url).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let tree: serde_json::Value =
+        serde_json::from_str(&get(format!("https://api.github.com/repos/{owner}/{repo}/git/trees/HEAD?recursive=1"))?).ok()?;
+    let wanted = format!("{skill}/SKILL.md");
+    let path = tree["tree"]
+        .as_array()?
+        .iter()
+        .filter_map(|e| e["path"].as_str())
+        .filter(|p| *p == wanted || p.ends_with(&format!("/{wanted}")))
+        .min_by_key(|p| p.len())?;
+    get(format!("https://raw.githubusercontent.com/{owner}/{repo}/HEAD/{path}"))
 }
 
 /// Searches the same public endpoint `npx skills find` uses.
@@ -143,6 +171,7 @@ fn search(q: &str) -> Result<Vec<Hit>, String> {
             skill: s["skillId"].as_str()?.into(),
             name: s["name"].as_str()?.into(),
             installs: s["installs"].as_u64().unwrap_or(0),
+            same: None,
         })
     };
     Ok(v["skills"].as_array().into_iter().flatten().filter_map(hit).collect())
@@ -185,6 +214,8 @@ enum Todo {
     Lookup(Vec<String>),
     /// Swap a local skill for the copy at this source so it can update.
     Track(String, String),
+    /// Read a skills.sh result in full. The name is the local skill it would replace, or "" when browsing.
+    Read(String, Hit),
 }
 
 struct App {
@@ -200,6 +231,8 @@ struct App {
     sort_by_uses: bool,
     add_src: String,
     confirm: Option<(Vec<String>, Option<usize>)>,
+    /// The skills.sh result being read: local skill name (or ""), the result, its text once loaded.
+    preview: Option<(String, Hit, Option<String>)>,
     agent: usize,
     /// Model per agent; empty means the agent's own default.
     models: [String; 3],
@@ -345,6 +378,7 @@ impl App {
             sort_by_uses: false,
             add_src: String::new(),
             confirm: None,
+            preview: None,
             agent: 0,
             models,
             efforts,
@@ -549,11 +583,12 @@ impl App {
                 self.add_src.clear();
             }
             Todo::ScanUsage => {
-                let dir = self.env.home.join(".claude/projects");
-                self.log = "Scanning Claude Code transcripts for skill usage...".into();
+                let (claude, codex) = (self.env.home.join(".claude/projects"), self.env.home.join(".codex/sessions"));
+                self.log = "Scanning Claude Code and Codex transcripts for skill usage...".into();
                 self.spawn(ctx, move || {
                     let mut u = Usage::new();
-                    core::scan_usage(&dir, &mut u);
+                    core::scan_usage(&claude, &mut u);
+                    core::scan_codex_usage(&codex, &mut u);
                     Msg::Usage(u)
                 });
             }
@@ -601,15 +636,30 @@ impl App {
             }
             Todo::Lookup(names) => {
                 self.log = format!("Looking up {} skill name(s) on skills.sh...", names.len());
+                let read = |n: &String| self.find(n).and_then(|s| std::fs::read_to_string(s.dir.as_ref()?.join("SKILL.md")).ok());
+                let mine: Vec<(String, Option<String>)> = names.iter().map(|n| (n.clone(), read(n))).collect();
+                // Comparing costs a GitHub request per candidate, so a bulk lookup only checks the top one.
+                let depth = if mine.len() == 1 { 4 } else { 1 };
                 self.spawn(ctx, move || {
-                    // ponytail: matches by name only, one request per skill; compare contents if false matches bite.
-                    let look = |n: String| {
+                    let look = |(n, md): (String, Option<String>)| {
                         let mut hits: Vec<Hit> = search(&n).ok()?.into_iter().filter(|h| h.skill == n || h.name == n).collect();
                         hits.sort_by(|a, b| b.installs.cmp(&a.installs));
+                        // The comparison happens here: only the public repo is fetched, your text is not sent.
+                        for h in hits.iter_mut().take(depth) {
+                            h.same = md.as_ref().and_then(|md| Some(core::similarity(md, &remote_md(&h.source, &h.skill)?)));
+                        }
+                        hits.sort_by(|a, b| b.same.cmp(&a.same));
                         std::thread::sleep(std::time::Duration::from_millis(150));
                         Some((n, hits))
                     };
-                    Msg::Matches(names.into_iter().filter_map(look).collect())
+                    Msg::Matches(mine.into_iter().filter_map(look).collect())
+                });
+            }
+            Todo::Read(name, hit) => {
+                self.preview = Some((name, hit.clone(), None));
+                self.spawn(ctx, move || {
+                    let text = remote_md(&hit.source, &hit.skill);
+                    Msg::Text(hit, text)
                 });
             }
             Todo::Track(name, source) => {
@@ -654,13 +704,19 @@ impl App {
                         }
                     }
                 }
+                Msg::Text(hit, text) => {
+                    // Ignore a reply for a result the user has already closed or moved on from.
+                    if let Some(p) = self.preview.as_mut().filter(|p| p.1.source == hit.source && p.1.skill == hit.skill) {
+                        p.2 = Some(text.unwrap_or_default());
+                    }
+                }
                 Msg::Matches(found) => {
                     let hit = found.iter().filter(|(_, h)| !h.is_empty()).count();
                     self.log = format!("skills.sh: {hit} of {} looked up have a skill with the same name there.", found.len());
                     self.matches.extend(found);
                 }
                 Msg::Usage(u) => {
-                    self.log = format!("Usage scan done: {} distinct skills invoked in Claude Code.", u.len());
+                    self.log = format!("Usage scan done: {} distinct skills used in Claude Code or Codex.", u.len());
                     self.usage = Some(u);
                 }
                 Msg::Answer { skill, who, text } => {
@@ -757,7 +813,7 @@ impl App {
                 if ui.button("Update all").on_hover_text("Runs: npx skills update -g -y").clicked() {
                     todo.push(Todo::Update(None));
                 }
-                if ui.button("Scan usage").on_hover_text("Counts skill calls in your Claude Code transcripts").clicked() {
+                if ui.button("Scan usage").on_hover_text("Counts skill use in your Claude Code and Codex transcripts").clicked() {
                     todo.push(Todo::ScanUsage);
                 }
                 ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("Search name, text or source").desired_width(240.0));
@@ -796,7 +852,7 @@ impl App {
                     }
                 });
             } else if narrowed && !names.is_empty() {
-                let local: Vec<String> = rows.iter().filter(|s| !s.plugin && !s.tracked).map(|s| s.name.clone()).collect();
+                let local: Vec<String> = rows.iter().filter(|s| !s.plugin && !s.tracked && s.outside.is_none()).map(|s| s.name.clone()).collect();
                 if !local.is_empty() {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let hover = format!("Sends the names of the {} untracked skills shown to skills.sh to see which exist there", local.len());
@@ -890,7 +946,7 @@ impl App {
                     Some((0, _)) => ui.painter().text(uses_pos, Align2::LEFT_CENTER, "never", font, AMBER),
                     Some((n, t)) => ui.painter().text(uses_pos, Align2::LEFT_CENTER, format!("{n}  ·  {}", days_ago(t)), font, TEXT),
                 };
-                match self.matches.get(&s.name).and_then(|m| m.first()).filter(|_| !s.tracked) {
+                match self.matches.get(&s.name).and_then(|m| m.first()).filter(|h| !s.tracked && h.same.is_none_or(|p| p >= 50)) {
                     Some(top) => text_in(ui, source_rect(rect), RichText::new(format!("local, on {}", top.source)).size(12.5).color(ACCENT)),
                     None => text_in(ui, source_rect(rect), RichText::new(&s.source).size(12.5).color(MUTED)),
                 }
@@ -968,7 +1024,14 @@ impl App {
             };
             ui.label(RichText::new(note).color(MUTED).size(12.5));
         }
-        if !s.tracked && !s.plugin {
+        if let Some(o) = &s.outside {
+            let note = format!(
+                "Lives outside the skill folders, at {}. Whatever put it there owns it and may put it back. Removing here only deletes the links.",
+                core::tilde(&self.env, o)
+            );
+            ui.label(RichText::new(note).color(MUTED).size(12.5));
+        }
+        if !s.tracked && !s.plugin && s.outside.is_none() {
             caption(ui, "ON SKILLS.SH");
             match self.matches.get(&s.name) {
                 None => {
@@ -981,19 +1044,25 @@ impl App {
                     ui.label(RichText::new("No skill with this name there. It is yours or came from somewhere else.").color(MUTED).size(12.5));
                 }
                 Some(found) => {
-                    ui.label(RichText::new("Same name, may not be the same skill. View it before switching.").color(MUTED).size(12.5));
+                    ui.label(RichText::new("Same name, compared with your copy. Read it before switching.").color(MUTED).size(12.5));
                     for h in found.iter().take(4) {
-                        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
-                        let mut label_rect = rect;
-                        label_rect.max.x -= 172.0;
-                        text_in(ui, label_rect, RichText::new(format!("{}  ·  {}", h.source, compact(h.installs))).size(12.5));
-                        let mut right = ui.new_child(UiBuilder::new().max_rect(rect).layout(Layout::right_to_left(Align::Center)));
+                        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 52.0), Sense::hover());
+                        let (top, bottom) = (rect.with_max_y(rect.top() + 24.0), rect.with_min_y(rect.top() + 24.0));
+                        text_in(ui, top, RichText::new(format!("{}  ·  {}", h.source, compact(h.installs))).size(12.5));
+                        let (verdict, color) = match h.same {
+                            Some(100) => ("identical".to_string(), GREEN),
+                            Some(p) if p >= 50 => (format!("{p}% same"), ACCENT),
+                            Some(p) => (format!("mostly different, {p}%"), RED),
+                            None => ("not compared".to_string(), MUTED),
+                        };
+                        text_in(ui, bottom, RichText::new(verdict).size(12.0).color(color));
+                        let mut right = ui.new_child(UiBuilder::new().max_rect(bottom).layout(Layout::right_to_left(Align::Center)));
                         let hover = "Moves your copy to the Trash, installs this one, and keeps it updating";
                         if right.small_button("Switch to this").on_hover_text(hover).clicked() {
                             todo.push(Todo::Track(s.name.clone(), h.source.clone()));
                         }
-                        if right.small_button("View").clicked() {
-                            todo.push(Todo::Open(PathBuf::from(format!("https://skills.sh/{}/{}", h.source, h.skill))));
+                        if right.small_button("Read it").on_hover_text("Opens the full skill text in a large window").clicked() {
+                            todo.push(Todo::Read(s.name.clone(), h.clone()));
                         }
                     }
                 }
@@ -1076,8 +1145,8 @@ impl App {
                 } else if right.button("Install").clicked() {
                     todo.push(Todo::Install(h.source.clone(), h.skill.clone()));
                 }
-                if right.small_button("View").on_hover_text("Open its page on skills.sh").clicked() {
-                    todo.push(Todo::Open(PathBuf::from(format!("https://skills.sh/{}/{}", h.source, h.skill))));
+                if right.small_button("Read it").on_hover_text("Opens the full skill text in a large window").clicked() {
+                    todo.push(Todo::Read(String::new(), h.clone()));
                 }
             }
         });
@@ -1256,6 +1325,47 @@ impl eframe::App for App {
                 View::Discover => self.market(ui, &mut todo),
                 _ => self.table(ui, &mut todo),
             });
+
+        if let Some((name, hit, text)) = self.preview.clone() {
+            let mut close = false;
+            let size = ctx.content_rect().size() * 0.8;
+            egui::Window::new("Read skill")
+                .collapsible(false)
+                .resizable(false)
+                .title_bar(false)
+                .fixed_size(size)
+                .frame(egui::Frame::window(&ctx.global_style()).inner_margin(Margin::same(18)))
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&hit.name).size(18.0).strong());
+                        ui.label(RichText::new(format!("{}  ·  {} installs", hit.source, compact(hit.installs))).color(MUTED).size(12.5));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            close = ui.button("Close").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
+                            let (label, action) = match name.is_empty() {
+                                true => ("Install", Todo::Install(hit.source.clone(), hit.skill.clone())),
+                                false => ("Switch to this", Todo::Track(name.clone(), hit.source.clone())),
+                            };
+                            if ui.button(RichText::new(label).color(ACCENT)).clicked() {
+                                todo.push(action);
+                                close = true;
+                            }
+                            if ui.button("Open on skills.sh").clicked() {
+                                todo.push(Todo::Open(PathBuf::from(format!("https://skills.sh/{}/{}", hit.source, hit.skill))));
+                            }
+                        });
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match text.as_deref() {
+                        None => drop(ui.label(RichText::new("Loading the skill text...").color(MUTED))),
+                        Some("") => drop(ui.label(RichText::new("Could not load the text from GitHub. Open it on skills.sh instead.").color(MUTED))),
+                        Some(t) => drop(ui.add(Label::new(RichText::new(t).monospace().size(13.0)).wrap())),
+                    });
+                });
+            if close {
+                self.preview = None;
+            }
+        }
 
         if let Some((names, only)) = self.confirm.clone() {
             let what = match names.as_slice() {

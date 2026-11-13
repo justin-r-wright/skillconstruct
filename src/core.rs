@@ -1,6 +1,6 @@
 //! Scanning and file operations. No UI in here so it can be tested against a fake home dir.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
@@ -69,6 +69,8 @@ pub struct Skill {
     pub plugin: bool,
     pub issues: Vec<String>,
     pub dir: Option<PathBuf>,
+    /// The skill really lives here, outside every skill folder: something else put it there and owns it.
+    pub outside: Option<PathBuf>,
 }
 
 impl Skill {
@@ -170,6 +172,7 @@ pub fn scan(env: &Env) -> Vec<Skill> {
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_default();
 
+    let inside: Vec<PathBuf> = env.roots.iter().filter_map(|r| fs::canonicalize(&r.dir).ok()).collect();
     for s in map.values_mut() {
         let mut reals: Vec<PathBuf> = Vec::new();
         for (i, e) in s.entries.iter().enumerate() {
@@ -194,9 +197,31 @@ pub fn scan(env: &Env) -> Vec<Skill> {
         }
         let src = lock["skills"][&s.name]["source"].as_str();
         s.tracked = src.is_some();
-        s.source = src.unwrap_or("local").to_string();
+        s.outside = reals.into_iter().find(|r| !inside.iter().any(|root| r.starts_with(root)));
+        s.source = match (src, &s.outside) {
+            (Some(src), _) => src.to_string(),
+            // Group by the folder the owner keeps its skills in, e.g. "linked from ~/.local/share/ego".
+            (None, Some(o)) => format!("linked from {}", tilde(env, o.parent().unwrap_or(o))),
+            (None, None) => "local".to_string(),
+        };
     }
     map.into_values().collect()
+}
+
+/// `p` with the home folder shortened to `~`.
+pub fn tilde(env: &Env, p: &Path) -> String {
+    let home = fs::canonicalize(&env.home).unwrap_or_else(|_| env.home.clone());
+    p.strip_prefix(&home).map_or_else(|_| p.display().to_string(), |rest| format!("~/{}", rest.display()))
+}
+
+/// Percent of distinct non-empty lines two texts share, 100 meaning identical.
+pub fn similarity(a: &str, b: &str) -> u8 {
+    let lines = |t: &str| t.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect::<HashSet<_>>();
+    let (a, b) = (lines(a), lines(b));
+    match a.union(&b).count() {
+        0 => 100,
+        all => (a.intersection(&b).count() * 100 / all) as u8,
+    }
 }
 
 /// Skills this app must not touch: shipped inside Claude Code plugins, or built into a harness
@@ -349,35 +374,65 @@ pub fn add_local(env: &Env, src: &Path) -> Result<String, String> {
 
 pub type Usage = HashMap<String, (u32, SystemTime)>;
 
-/// Count Skill tool calls and typed /slash commands in Claude Code transcripts under `dir`.
-/// ponytail: Claude Code only, and reads every transcript on each scan (seconds per GB).
-/// Add a cache keyed on file mtime, and a Codex session reader, if this gets used daily.
-pub fn scan_usage(dir: &Path, out: &mut Usage) {
-    // A Skill tool call the model made, and a /slash command the user typed.
-    const NEEDLES: [(&str, char); 2] =
-        [(r#""name":"Skill","input":{"skill":""#, '"'), ("<command-name>/", '<')];
+fn bump(out: &mut Usage, name: &str, when: SystemTime) {
+    let slot = out.entry(name.to_string()).or_insert((0, UNIX_EPOCH));
+    slot.0 += 1;
+    slot.1 = slot.1.max(when);
+}
+
+/// Runs `f` on the text and modified time of every .jsonl transcript under `dir`.
+/// ponytail: reads every transcript on each scan (seconds per GB). Cache on file mtime if this gets used daily.
+fn each_transcript(dir: &Path, f: &mut dyn FnMut(&str, SystemTime)) {
     let Ok(rd) = fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let Ok(ft) = e.file_type() else { continue };
         let p = e.path();
         if ft.is_dir() {
-            scan_usage(&p, out);
+            each_transcript(&p, f);
         } else if ft.is_file() && p.extension().is_some_and(|x| x == "jsonl") {
             let Ok(bytes) = fs::read(&p) else { continue };
             let when = e.metadata().and_then(|m| m.modified()).unwrap_or(UNIX_EPOCH);
-            let text = String::from_utf8_lossy(&bytes);
-            for (needle, end) in NEEDLES {
-                for (idx, _) in text.match_indices(needle) {
-                    let rest = &text[idx + needle.len()..];
-                    if let Some(name) = rest.split(end).next().filter(|n| !n.is_empty() && n.len() < 100) {
-                        let slot = out.entry(name.to_string()).or_insert((0, UNIX_EPOCH));
-                        slot.0 += 1;
-                        slot.1 = slot.1.max(when);
-                    }
+            f(&String::from_utf8_lossy(&bytes), when);
+        }
+    }
+}
+
+/// Count Skill tool calls and typed /slash commands in Claude Code transcripts under `dir`.
+pub fn scan_usage(dir: &Path, out: &mut Usage) {
+    // A Skill tool call the model made, and a /slash command the user typed.
+    const NEEDLES: [(&str, char); 2] =
+        [(r#""name":"Skill","input":{"skill":""#, '"'), ("<command-name>/", '<')];
+    each_transcript(dir, &mut |text, when| {
+        for (needle, end) in NEEDLES {
+            for (idx, _) in text.match_indices(needle) {
+                let rest = &text[idx + needle.len()..];
+                if let Some(name) = rest.split(end).next().filter(|n| !n.is_empty() && n.len() < 100) {
+                    bump(out, name, when);
                 }
             }
         }
-    }
+    });
+}
+
+/// Count skills Codex opened in the session transcripts under `dir`.
+/// ponytail: Codex has no skill tool, so "used" means a command it ran named `skills/<name>/SKILL.md`.
+/// A search that merely prints that path counts too; parse the command if that inflates numbers.
+pub fn scan_codex_usage(dir: &Path, out: &mut Usage) {
+    const CALLS: [&str; 3] =
+        [r#""type":"custom_tool_call","#, r#""type":"function_call","#, r#""type":"local_shell_call","#];
+    each_transcript(dir, &mut |text, when| {
+        for line in text.lines().filter(|l| CALLS.iter().any(|c| l.contains(c))) {
+            let mut seen: Vec<&str> = Vec::new();
+            for (idx, _) in line.match_indices("/SKILL.md") {
+                let Some((before, name)) = line[..idx].rsplit_once('/') else { continue };
+                let plain = !name.is_empty() && name.len() < 100 && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+                if plain && before.ends_with("skills") && !seen.contains(&name) {
+                    seen.push(name);
+                    bump(out, name, when);
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -494,5 +549,37 @@ mod tests {
         assert_eq!(u.len(), 1);
         assert_eq!(u["tdd"].0, 3);
         let _ = fs::remove_dir_all(&env.home);
+    }
+
+    #[test]
+    fn codex_usage() {
+        let env = fake_home("codex-usage");
+        let dir = env.home.join("sessions");
+        fs::create_dir_all(&dir).unwrap();
+        let call = r#"{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"cat ~/.agents/skills/tdd/SKILL.md ~/.agents/skills/tdd/SKILL.md ~/.codex/skills/.system/imagegen/SKILL.md"}}"#;
+        let echo = r#"{"type":"response_item","payload":{"type":"custom_tool_call_output","output":"skills/tdd/SKILL.md"}}"#;
+        fs::write(dir.join("a.jsonl"), format!("{call}\n{echo}\n")).unwrap();
+        let mut u = Usage::new();
+        scan_codex_usage(&dir, &mut u);
+        assert_eq!(u.len(), 1);
+        assert_eq!(u["tdd"].0, 1);
+    }
+
+    #[test]
+    fn outside_and_similarity() {
+        let env = fake_home("outside");
+        let theirs = env.home.join("apps/ego/skills-src");
+        write_skill(&theirs, "---\nname: ego\ndescription: d\n---\n");
+        write_skill(&env.roots[0].dir.join("mine"), "---\nname: mine\ndescription: d\n---\n");
+        symlink(&theirs, env.roots[1].dir.join("ego")).unwrap();
+        let skills = scan(&env);
+        let ego = skills.iter().find(|s| s.name == "ego").unwrap();
+        assert!(ego.outside.is_some());
+        assert_eq!(ego.source, "linked from ~/apps/ego");
+        assert!(skills.iter().find(|s| s.name == "mine").unwrap().outside.is_none());
+
+        assert_eq!(similarity("a\nb\n", " a\n\nb"), 100);
+        assert_eq!(similarity("a\nb", "a\nc"), 33);
+        assert_eq!(similarity("a", "b"), 0);
     }
 }

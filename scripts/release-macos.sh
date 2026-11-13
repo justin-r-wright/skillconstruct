@@ -55,6 +55,9 @@ if [ -n "${NOTARY_PROFILE:-}" ]; then
   xcrun stapler staple "$APP"
   ditto -c -k --keepParent "$APP" "$ZIP"   # re-zip so the download carries the stapled ticket
   spctl --assess --type execute --verbose "$APP"
+  # Point the Homebrew cask at this build. Commit it after publishing the release.
+  sed -i '' -e "s/^  version \".*\"/  version \"$VERSION\"/" \
+    -e "s/^  sha256 \".*\"/  sha256 \"$(shasum -a 256 "$ZIP" | cut -d' ' -f1)\"/" Casks/skill-construct.rb
 else
   echo "Signed but NOT notarized (set NOTARY_PROFILE). Gatekeeper will still warn on other Macs."
 fi
