@@ -22,11 +22,18 @@ Linux should work but is untested. Windows is not supported.
 - **Ask an agent.** "Do I still need this?" goes to `claude`, `codex` or `opencode` using
   the logins you already have, with the skill and the rest of your library as context.
 
-## Run it
+## Install
+
+**macOS:** download the latest zip from
+[Releases](https://github.com/justin-r-wright/skillconstruct/releases/latest), unzip it and drag
+`Skill Construct.app` to Applications. The app is a universal build (Apple Silicon and Intel),
+signed and notarized.
+
+**From source** (macOS or Linux), with a recent Rust toolchain:
 
     cargo run --release
 
-Requires a recent Rust toolchain. Updating and adding remote skills needs Node (`npx`).
+Updating and adding remote skills needs Node (`npx`).
 Asking an agent needs that agent's CLI installed and logged in.
 
 ## How it works
@@ -44,6 +51,9 @@ Asking an agent needs that agent's CLI installed and logged in.
 
 `src/core.rs` holds scanning and file operations with no UI, tested against a throwaway
 home directory. `src/main.rs` is the egui front end.
+
+`scripts/release-macos.sh` builds the signed macOS app into `dist/`. It needs a Developer ID
+certificate, and a `notarytool` keychain profile passed as `NOTARY_PROFILE` to notarize.
 
 ## License
 
