@@ -26,7 +26,7 @@ impl Env {
 
     pub fn at(home: PathBuf) -> Env {
         let roots = [
-            ("agents", ".agents/skills"),
+            ("shared", ".agents/skills"),
             ("claude", ".claude/skills"),
             ("codex", ".codex/skills"),
             ("cursor", ".cursor/skills"),
@@ -35,7 +35,10 @@ impl Env {
         .into_iter()
         .map(|(label, p)| Root { label, dir: home.join(p) })
         .collect();
-        Env { trash: home.join(".Trash"), roots, home }
+        // ponytail: on Linux this drops folders into the XDG trash without a .trashinfo file, so
+        // they are recoverable by hand but not listed by the file manager. Write .trashinfo if that matters.
+        let trash = if cfg!(target_os = "macos") { ".Trash" } else { ".local/share/Trash/files" };
+        Env { trash: home.join(trash), roots, home }
     }
 }
 
@@ -105,7 +108,8 @@ pub fn parse_frontmatter(text: &str) -> HashMap<String, String> {
         let t = v.trim();
         let quoted = t.len() >= 2
             && ((t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\'')));
-        *v = if quoted { t[1..t.len() - 1].to_string() } else { t.to_string() };
+        // Double-quoted YAML strings escape their inner quotes.
+        *v = if quoted { t[1..t.len() - 1].replace("\\\"", "\"") } else { t.to_string() };
     }
     map
 }
@@ -276,6 +280,23 @@ pub fn remove(env: &Env, name: &str, only: Option<usize>) -> Result<(), String> 
             symlink(&real, &p).map_err(err)?;
         }
     }
+    if !(0..env.roots.len()).any(|i| fs::symlink_metadata(path(i)).is_ok()) {
+        forget(env, name)?;
+    }
+    Ok(())
+}
+
+/// Drop a skill from the `npx skills` lock file, otherwise `npx skills update` reinstalls it.
+fn forget(env: &Env, name: &str) -> Result<(), String> {
+    let lock_path = env.home.join(".agents/.skill-lock.json");
+    let Ok(text) = fs::read_to_string(&lock_path) else { return Ok(()) };
+    let mut lock: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("removed, but could not read the lock file: {e}"))?;
+    let gone = lock["skills"].as_object_mut().and_then(|m| m.remove(name)).is_some();
+    if gone {
+        let out = serde_json::to_string_pretty(&lock).map_err(|e| e.to_string())?;
+        fs::write(&lock_path, out + "\n").map_err(err)?;
+    }
     Ok(())
 }
 
@@ -342,7 +363,7 @@ mod tests {
     use super::*;
 
     fn fake_home(tag: &str) -> Env {
-        let home = std::env::temp_dir().join(format!("skillet-test-{}-{tag}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("skillconstruct-test-{}-{tag}", std::process::id()));
         let _ = fs::remove_dir_all(&home);
         let env = Env::at(home);
         for r in &env.roots[..3] {
@@ -396,7 +417,13 @@ mod tests {
         // Linking it back, then removing everywhere, trashes the one real copy.
         link(&env, get("tdd"), 1).unwrap();
         assert!(claude.join("tdd/SKILL.md").is_file());
+        let lock = env.home.join(".agents/.skill-lock.json");
+        fs::write(&lock, r#"{"version":3,"skills":{"tdd":{"source":"a/b"},"keep":{"source":"c/d"}},"dismissed":{}}"#).unwrap();
         remove(&env, "tdd", None).unwrap();
+        // The lock entry goes too, and nothing else in the file is touched or reordered.
+        let after = fs::read_to_string(&lock).unwrap();
+        assert!(!after.contains("tdd") && after.contains("keep"), "{after}");
+        assert!(after.find("version").unwrap() < after.find("skills").unwrap());
         for r in &env.roots {
             assert!(fs::symlink_metadata(r.dir.join("tdd")).is_err());
         }

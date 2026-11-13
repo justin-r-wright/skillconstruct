@@ -1,12 +1,19 @@
 [package]
-name = "skillet"
+name = "skillconstruct"
 version = "0.1.0"
 edition = "2021"
+description = "A desktop app for managing agent skills across Claude Code, Codex, Cursor and opencode"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/justin-r-wright/skillconstruct"
+keywords = ["agent-skills", "claude", "codex", "egui"]
+categories = ["development-tools"]
 
 [dependencies]
 # glow instead of the default wgpu backend: a fraction of the build size, plenty for a table UI.
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "clipboard"] }
-serde_json = "1"
+# preserve_order: rewriting the skills lock file must not shuffle its keys.
+serde_json = { version = "1", features = ["preserve_order"] }
 
 [profile.dev]
 debug = false
