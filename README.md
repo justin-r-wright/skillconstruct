@@ -59,7 +59,10 @@ Skill Construct is the loading room where you sort that out.
 **macOS, with Homebrew:**
 
     brew tap justin-r-wright/skillconstruct https://github.com/justin-r-wright/skillconstruct
+    brew trust justin-r-wright/skillconstruct
     brew install --cask skill-construct
+
+Skip the `brew trust` line on older Homebrew versions that do not have that command.
 
 **macOS, by hand:** download the latest zip from
 [Releases](https://github.com/justin-r-wright/skillconstruct/releases/latest), unzip it and drag
