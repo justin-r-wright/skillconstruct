@@ -1,17 +1,20 @@
 mod core;
+mod update;
 
 use core::{Env, Kind, Skill, Usage};
 use eframe::egui::{
     self, vec2, Align, Align2, Color32, CornerRadius, FontId, Label, Layout, Margin, Rect, RichText, Sense, Stroke,
     UiBuilder,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::SystemTime;
 
 const AGENTS: [&str; 3] = ["claude", "codex", "opencode"];
+/// Remembered model and thinking level per agent, under the home folder: one `agent=model level` line each.
+const MODELS_FILE: &str = ".config/skillconstruct/models";
 
 const BG: Color32 = Color32::from_rgb(15, 17, 20);
 const PANEL: Color32 = Color32::from_rgb(20, 23, 27);
@@ -46,7 +49,7 @@ fn adopt_shell_path() {
 fn main() -> eframe::Result {
     adopt_shell_path();
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1520.0, 940.0]).with_min_inner_size([1100.0, 600.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1760.0, 980.0]).with_min_inner_size([1100.0, 600.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -54,7 +57,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             setup_look(&cc.egui_ctx);
-            Ok(Box::new(App::new()))
+            Ok(Box::new(App::new(&cc.egui_ctx)))
         }),
     )
 }
@@ -103,9 +106,54 @@ fn setup_look(ctx: &egui::Context) {
 }
 
 enum Msg {
-    Job { title: String, out: String },
+    /// `relink`: a skill to link back into these harnesses once the job is done.
+    Job { title: String, out: String, relink: Option<(String, Vec<usize>)> },
+    Matches(Vec<(String, Vec<Hit>)>),
     Usage(Usage),
     Answer { skill: String, who: &'static str, text: String },
+    Models(usize, Vec<(String, Vec<String>)>),
+    Hits(Result<Vec<Hit>, String>),
+    UpdateAvailable(Option<(String, String)>),
+    Updated(Result<PathBuf, String>),
+}
+
+/// One search result from skills.sh.
+#[derive(Clone)]
+struct Hit {
+    source: String,
+    skill: String,
+    name: String,
+    installs: u64,
+}
+
+/// Searches the same public endpoint `npx skills find` uses.
+fn search(q: &str) -> Result<Vec<Hit>, String> {
+    let out = Command::new("curl")
+        .args(["-fsSG", "-m", "15", "https://skills.sh/api/search", "-d", "limit=50", "--data-urlencode"])
+        .arg(format!("q={q}"))
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+    let hit = |s: &serde_json::Value| {
+        Some(Hit {
+            source: s["source"].as_str()?.into(),
+            skill: s["skillId"].as_str()?.into(),
+            name: s["name"].as_str()?.into(),
+            installs: s["installs"].as_u64().unwrap_or(0),
+        })
+    };
+    Ok(v["skills"].as_array().into_iter().flatten().filter_map(hit).collect())
+}
+
+fn compact(n: u64) -> String {
+    match n {
+        0..1_000 => n.to_string(),
+        1_000..1_000_000 => format!("{:.1}k", n as f64 / 1e3),
+        _ => format!("{:.1}M", n as f64 / 1e6),
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -114,6 +162,7 @@ enum View {
     Issues,
     Unused,
     Plugins,
+    Discover,
     Source(String),
 }
 
@@ -129,6 +178,13 @@ enum Todo {
     Open(PathBuf),
     Rescan,
     ScanUsage,
+    Search,
+    Install(String, String),
+    InstallUpdate,
+    /// Look these skill names up on skills.sh.
+    Lookup(Vec<String>),
+    /// Swap a local skill for the copy at this source so it can update.
+    Track(String, String),
 }
 
 struct App {
@@ -137,14 +193,32 @@ struct App {
     plugin_skills: Vec<Skill>,
     usage: Option<Usage>,
     selected: Option<String>,
+    /// Ticked rows, for removing a hand-picked set.
+    checked: HashSet<String>,
     view: View,
     filter: String,
     sort_by_uses: bool,
     add_src: String,
     confirm: Option<(Vec<String>, Option<usize>)>,
     agent: usize,
+    /// Model per agent; empty means the agent's own default.
+    models: [String; 3],
+    /// Thinking level per agent; empty means the agent's own default.
+    efforts: [String; 3],
+    /// Per agent: (model, thinking levels it supports; empty = the agent's generic set).
+    model_lists: [Vec<(String, Vec<String>)>; 3],
+    model_filter: String,
+    chat_open: bool,
+    market_q: String,
+    hits: Vec<Hit>,
+    /// Untracked skills looked up on skills.sh: same-named skills there, most installed first.
+    matches: HashMap<String, Vec<Hit>>,
+    searching: bool,
+    searched: bool,
+    update: Option<(String, String)>,
+    updating: bool,
     question: String,
-    /// Per skill: (who said it, text).
+    /// Per skill (or "" for the whole library): (who said it, text).
     chats: HashMap<String, Vec<(&'static str, String)>>,
     asking: Option<String>,
     log: String,
@@ -247,21 +321,44 @@ fn nav_item(ui: &mut egui::Ui, selected: bool, label: &str, count: usize) -> boo
 }
 
 impl App {
-    fn new() -> App {
+    fn new(ctx: &egui::Context) -> App {
         let env = Env::real();
         let (tx, rx) = channel();
+        let mut models: [String; 3] = Default::default();
+        let mut efforts: [String; 3] = Default::default();
+        for line in std::fs::read_to_string(env.home.join(MODELS_FILE)).unwrap_or_default().lines() {
+            if let Some((agent, model)) = line.split_once('=') {
+                if let Some(i) = AGENTS.iter().position(|a| *a == agent) {
+                    let (model, effort) = model.split_once(' ').unwrap_or((model, ""));
+                    (models[i], efforts[i]) = (model.to_string(), effort.to_string());
+                }
+            }
+        }
         let mut app = App {
             skills: Vec::new(),
             plugin_skills: Vec::new(),
             usage: None,
             selected: None,
+            checked: HashSet::new(),
             view: View::All,
             filter: String::new(),
             sort_by_uses: false,
             add_src: String::new(),
             confirm: None,
             agent: 0,
-            question: "Do I still need this skill? Does it overlap with another one I have?".into(),
+            models,
+            efforts,
+            model_lists: [["fable", "opus", "sonnet", "haiku"].map(|m| (m.to_string(), Vec::new())).to_vec(), Vec::new(), Vec::new()],
+            model_filter: String::new(),
+            chat_open: true,
+            market_q: String::new(),
+            hits: Vec::new(),
+            matches: HashMap::new(),
+            searching: false,
+            searched: false,
+            update: None,
+            updating: false,
+            question: String::new(),
             chats: HashMap::new(),
             asking: None,
             log: "Ready.".into(),
@@ -272,12 +369,29 @@ impl App {
             rx,
         };
         app.rescan();
+        app.spawn(ctx, || Msg::UpdateAvailable(update::check()));
+        app.spawn(ctx, || {
+            let out = run(Command::new("opencode").arg("models"));
+            Msg::Models(2, out.lines().filter(|l| l.contains('/') && !l.contains(' ')).map(|l| (l.to_string(), Vec::new())).collect())
+        });
+        app.spawn(ctx, || {
+            // Codex prints its own catalog, including which thinking levels each model takes.
+            let out = Command::new("codex").args(["debug", "models"]).stdin(Stdio::null()).output().map(|o| o.stdout).unwrap_or_default();
+            let v: serde_json::Value = serde_json::from_slice(&out).unwrap_or_default();
+            let model = |m: &serde_json::Value| {
+                let levels = m["supported_reasoning_levels"].as_array().into_iter().flatten();
+                (m["visibility"] == "list").then_some(())?;
+                Some((m["slug"].as_str()?.to_string(), levels.filter_map(|l| Some(l["effort"].as_str()?.to_string())).collect()))
+            };
+            Msg::Models(1, v["models"].as_array().into_iter().flatten().filter_map(model).collect())
+        });
         app
     }
 
     fn rescan(&mut self) {
         self.skills = core::scan(&self.env);
         self.plugin_skills = core::plugin_skills(&self.env);
+        self.checked.retain(|n| self.skills.iter().any(|s| &s.name == n));
     }
 
     fn find(&self, name: &str) -> Option<&Skill> {
@@ -293,9 +407,13 @@ impl App {
         });
     }
 
-    fn job(&mut self, ctx: &egui::Context, title: String, mut cmd: Command) {
+    fn job(&mut self, ctx: &egui::Context, title: String, cmd: Command) {
+        self.job_then(ctx, title, cmd, None);
+    }
+
+    fn job_then(&mut self, ctx: &egui::Context, title: String, mut cmd: Command, relink: Option<(String, Vec<usize>)>) {
         self.log = format!("{title}\nrunning...");
-        self.spawn(ctx, move || Msg::Job { out: run(&mut cmd), title });
+        self.spawn(ctx, move || Msg::Job { out: run(&mut cmd), title, relink });
     }
 
     fn report(&mut self, what: &str, r: Result<(), String>) {
@@ -310,8 +428,9 @@ impl App {
         self.usage.as_ref().map(|u| u.get(name).copied().unwrap_or((0, SystemTime::UNIX_EPOCH)))
     }
 
-    fn in_view(&self, s: &Skill) -> bool {
-        match &self.view {
+    fn in_view(&self, view: &View, s: &Skill) -> bool {
+        match view {
+            View::Discover => false,
             View::Plugins => s.plugin,
             _ if s.plugin => false,
             View::All => true,
@@ -321,7 +440,41 @@ impl App {
         }
     }
 
-    fn prompt(&self, skill: &Skill, question: &str) -> String {
+    /// Thinking levels the picked model of agent `a` accepts.
+    fn levels(&self, a: usize) -> Vec<String> {
+        let generic: &[&str] = match AGENTS[a] {
+            "claude" => &["low", "medium", "high", "xhigh", "max"],
+            "codex" => &["low", "medium", "high", "xhigh"],
+            // ponytail: opencode calls these variants and they differ per provider; this is the common set.
+            _ => &["minimal", "low", "medium", "high", "max"],
+        };
+        match self.model_lists[a].iter().find(|(m, l)| *m == self.models[a] && !l.is_empty()) {
+            Some((_, l)) => l.clone(),
+            None => generic.iter().map(|l| l.to_string()).collect(),
+        }
+    }
+
+    /// `key` is a skill name, or "" to ask about the whole library.
+    fn prompt(&self, key: &str, question: &str) -> String {
+        let intro = "You are helping me audit the agent skills installed on my computer. Answer directly and \
+                     briefly, with a clear keep / remove / merge recommendation when asked. Plain text only, no \
+                     markdown. Do not use tools or change anything.";
+        let others: String = self
+            .skills
+            .iter()
+            .chain(&self.plugin_skills)
+            .filter(|s| s.name != key)
+            .map(|s| format!("- {} [{}]: {}\n", s.name, s.source, s.description.chars().take(200).collect::<String>()))
+            .collect();
+        let so_far: String = self
+            .chats
+            .get(key)
+            .map(|c| c.iter().map(|(who, text)| format!("{who}: {text}\n")).collect())
+            .unwrap_or_else(|| "(none)".into());
+        let tail = format!("=== Conversation so far ===\n{so_far}\n\nMy question: {question}");
+        let Some(skill) = self.find(key) else {
+            return format!("{intro}\n\n=== My skills ===\n{others}\n{tail}");
+        };
         let md = skill
             .dir
             .as_ref()
@@ -339,24 +492,10 @@ impl App {
             Some((n, t)) => format!("{n} invocations in Claude Code transcripts, last {}", days_ago(t)),
             None => "usage not scanned".into(),
         };
-        let others: String = self
-            .skills
-            .iter()
-            .chain(&self.plugin_skills)
-            .filter(|s| s.name != skill.name)
-            .map(|s| format!("- {}: {}\n", s.name, s.description.chars().take(200).collect::<String>()))
-            .collect();
-        let so_far: String = self
-            .chats
-            .get(&skill.name)
-            .map(|c| c.iter().map(|(who, text)| format!("{who}: {text}\n")).collect())
-            .unwrap_or_else(|| "(none)".into());
         format!(
-            "You are helping me audit the agent skills installed on my computer. Answer directly and \
-             briefly, with a clear keep / remove / merge recommendation when asked. Plain text only, no \
-             markdown. Do not use tools or change anything.\n\n\
+            "{intro}\n\n\
              Skill under review: {}\nSource: {}\nInstalled for: {}\nUsage: {usage}\nKnown issues: {}\n\n\
-             === SKILL.md ===\n{}\n\n=== My other skills ===\n{others}\n=== Conversation so far ===\n{so_far}\n\nMy question: {question}",
+             === SKILL.md ===\n{}\n\n=== My other skills ===\n{others}\n{tail}",
             skill.name,
             skill.source,
             if installed.is_empty() { "plugin only".to_string() } else { installed.join(", ") },
@@ -418,22 +557,83 @@ impl App {
                     Msg::Usage(u)
                 });
             }
-            Todo::Ask(name) => {
-                let Some(skill) = self.find(&name) else { return };
+            Todo::Ask(key) => {
                 let q = self.question.trim().to_string();
-                let prompt = self.prompt(skill, &q);
+                let prompt = self.prompt(&key, &q);
                 let who = AGENTS[self.agent];
+                let (model, effort) = (self.models[self.agent].clone(), self.efforts[self.agent].clone());
+                let opt = |flag: &str, value: &str| (!value.is_empty()).then(|| [flag.to_string(), value.to_string()]).into_iter().flatten();
                 let mut cmd = Command::new(who);
                 match who {
-                    "claude" => cmd.args(["-p", &prompt, "--tools", ""]),
-                    "codex" => cmd.args(["exec", "--skip-git-repo-check", "-s", "read-only", &prompt]),
-                    _ => cmd.args(["run", &prompt]),
+                    "claude" => cmd.args(["-p", &prompt, "--tools", ""]).args(opt("--model", &model)).args(opt("--effort", &effort)),
+                    "codex" => {
+                        let level = if effort.is_empty() { String::new() } else { format!("model_reasoning_effort=\"{effort}\"") };
+                        cmd.args(["exec", "--skip-git-repo-check", "-s", "read-only"]).args(opt("-m", &model)).args(opt("-c", &level)).arg(&prompt)
+                    }
+                    _ => cmd.arg("run").args(opt("-m", &model)).args(opt("--variant", &effort)).arg(&prompt),
                 };
                 cmd.current_dir(std::env::temp_dir());
-                self.chats.entry(name.clone()).or_default().push(("you", q));
-                self.asking = Some(name.clone());
+                let saved: String = (0..3).map(|i| format!("{}={} {}\n", AGENTS[i], self.models[i], self.efforts[i])).collect();
+                let path = self.env.home.join(MODELS_FILE);
+                let _ = std::fs::create_dir_all(path.parent().unwrap()).and_then(|_| std::fs::write(&path, saved));
+                self.chats.entry(key.clone()).or_default().push(("you", q));
+                self.asking = Some(key.clone());
                 self.question.clear();
-                self.spawn(ctx, move || Msg::Answer { text: run(&mut cmd), who, skill: name });
+                self.spawn(ctx, move || Msg::Answer { text: run(&mut cmd), who, skill: key });
+            }
+            Todo::Search => {
+                let q = self.market_q.trim().to_string();
+                if q.len() < 2 || self.searching {
+                    return;
+                }
+                self.searching = true;
+                self.spawn(ctx, move || Msg::Hits(search(&q)));
+            }
+            Todo::Install(source, skill) => {
+                // Names come from the network: never let one be read as a flag.
+                if source.starts_with('-') || skill.starts_with('-') {
+                    self.log = format!("install: refusing odd name {source} {skill}");
+                    return;
+                }
+                let mut cmd = Command::new("npx");
+                cmd.args(["-y", "skills", "add", &source, "-s", &skill, "-g", "-y"]);
+                self.job(ctx, format!("npx skills add {source} -s {skill}"), cmd);
+            }
+            Todo::Lookup(names) => {
+                self.log = format!("Looking up {} skill name(s) on skills.sh...", names.len());
+                self.spawn(ctx, move || {
+                    // ponytail: matches by name only, one request per skill; compare contents if false matches bite.
+                    let look = |n: String| {
+                        let mut hits: Vec<Hit> = search(&n).ok()?.into_iter().filter(|h| h.skill == n || h.name == n).collect();
+                        hits.sort_by(|a, b| b.installs.cmp(&a.installs));
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        Some((n, hits))
+                    };
+                    Msg::Matches(names.into_iter().filter_map(look).collect())
+                });
+            }
+            Todo::Track(name, source) => {
+                let Some(s) = self.find(&name) else { return };
+                if source.starts_with('-') || name.starts_with('-') {
+                    return;
+                }
+                // The installer deletes a real copy in its way and ignores the others, so move
+                // them all to the Trash first and link the new copy back where the skill was.
+                let had: Vec<usize> = (0..s.entries.len()).filter(|i| s.entries[*i].is_some()).collect();
+                if let Err(e) = core::remove(&self.env, &name, None) {
+                    self.report(&format!("track {name}"), Err(e));
+                    return;
+                }
+                self.matches.remove(&name);
+                let mut cmd = Command::new("npx");
+                cmd.args(["-y", "skills", "add", &source, "-s", &name, "-g", "-y"]);
+                self.job_then(ctx, format!("track {name} from {source} (your old copy is in the Trash)"), cmd, Some((name, had)));
+            }
+            Todo::InstallUpdate => {
+                if let Some((_, url)) = self.update.clone() {
+                    self.updating = true;
+                    self.spawn(ctx, move || Msg::Updated(update::install(&url)));
+                }
             }
         }
     }
@@ -442,9 +642,22 @@ impl App {
         while let Ok(msg) = self.rx.try_recv() {
             self.busy -= 1;
             match msg {
-                Msg::Job { title, out } => {
+                Msg::Job { title, out, relink } => {
                     self.log = format!("{title}\n{out}");
                     self.rescan();
+                    if let Some((name, had)) = relink {
+                        if let Some(s) = self.find(&name).cloned() {
+                            for i in had.into_iter().filter(|i| s.entries[*i].is_none()) {
+                                let _ = core::link(&self.env, &s, i);
+                            }
+                            self.rescan();
+                        }
+                    }
+                }
+                Msg::Matches(found) => {
+                    let hit = found.iter().filter(|(_, h)| !h.is_empty()).count();
+                    self.log = format!("skills.sh: {hit} of {} looked up have a skill with the same name there.", found.len());
+                    self.matches.extend(found);
                 }
                 Msg::Usage(u) => {
                     self.log = format!("Usage scan done: {} distinct skills invoked in Claude Code.", u.len());
@@ -454,6 +667,21 @@ impl App {
                     self.chats.entry(skill).or_default().push((who, text));
                     self.asking = None;
                 }
+                Msg::Models(i, list) => self.model_lists[i] = list,
+                Msg::Hits(r) => {
+                    self.searching = false;
+                    self.searched = true;
+                    self.hits = r.unwrap_or_else(|e| {
+                        self.log = format!("skills.sh search FAILED: {e}");
+                        Vec::new()
+                    });
+                }
+                Msg::UpdateAvailable(u) => self.update = u,
+                Msg::Updated(Ok(app)) => update::relaunch(&app),
+                Msg::Updated(Err(e)) => {
+                    self.updating = false;
+                    self.log = format!("update FAILED: {e}");
+                }
             }
         }
     }
@@ -461,18 +689,15 @@ impl App {
     fn nav(&mut self, ui: &mut egui::Ui, todo: &mut Vec<Todo>) {
         ui.add_space(4.0);
         ui.label(RichText::new("Skill Construct").size(20.0).strong());
-        ui.label(RichText::new("Agent skills on this Mac").size(12.0).color(MUTED));
+        ui.label(RichText::new(concat!("Agent skills on this Mac  ·  v", env!("CARGO_PKG_VERSION"))).size(12.0).color(MUTED));
         ui.add_space(8.0);
 
-        let count = |v: View| {
-            let probe = App { view: v, ..self.shallow() };
-            self.skills.iter().chain(&self.plugin_skills).filter(|s| probe.in_view(s)).count()
-        };
+        let count = |v: &View| self.skills.iter().chain(&self.plugin_skills).filter(|s| self.in_view(v, s)).count();
         let mut items = vec![(View::All, "All skills".to_string()), (View::Issues, "Needs attention".to_string())];
         if self.usage.is_some() {
             items.push((View::Unused, "Never used".to_string()));
         }
-        items.push((View::Plugins, "From plugins".to_string()));
+        items.push((View::Plugins, "Built in & plugins".to_string()));
         let mut sources: Vec<(String, usize)> = Vec::new();
         for s in &self.skills {
             match sources.iter_mut().find(|(n, _)| n == &s.source) {
@@ -481,13 +706,17 @@ impl App {
             }
         }
         sources.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        let counted: Vec<(View, String, usize)> = items.into_iter().map(|(v, l)| (v.clone(), l, count(v))).collect();
+        let counted: Vec<(View, String, usize)> = items.into_iter().map(|(v, l)| (v.clone(), l, count(&v))).collect();
 
         caption(ui, "LIBRARY");
         for (view, label, n) in counted {
             if nav_item(ui, self.view == view, &label, n) {
                 self.view = view;
             }
+        }
+        caption(ui, "DISCOVER");
+        if nav_item(ui, self.view == View::Discover, "Browse skills.sh", self.hits.len()) {
+            self.view = View::Discover;
         }
         caption(ui, "SOURCES");
         // Leave room at the bottom for the add box.
@@ -510,38 +739,13 @@ impl App {
         }
     }
 
-    /// Just enough of self to reuse `in_view` with a different view while counting.
-    fn shallow(&self) -> App {
-        let (tx, rx) = channel();
-        App {
-            env: Env::at(self.env.home.clone()),
-            skills: Vec::new(),
-            plugin_skills: Vec::new(),
-            usage: self.usage.clone(),
-            selected: None,
-            view: View::All,
-            filter: String::new(),
-            sort_by_uses: false,
-            add_src: String::new(),
-            confirm: None,
-            agent: 0,
-            question: String::new(),
-            chats: HashMap::new(),
-            asking: None,
-            log: String::new(),
-            log_open: false,
-            busy: 0,
-            tx,
-            rx,
-        }
-    }
-
     fn table(&mut self, ui: &mut egui::Ui, todo: &mut Vec<Todo>) {
         let title = match &self.view {
             View::All => "All skills".to_string(),
             View::Issues => "Needs attention".to_string(),
             View::Unused => "Never used".to_string(),
-            View::Plugins => "From plugins".to_string(),
+            View::Plugins => "Built in & plugins".to_string(),
+            View::Discover => "Browse skills.sh".to_string(),
             View::Source(s) => s.clone(),
         };
         ui.horizontal(|ui| {
@@ -565,7 +769,7 @@ impl App {
             .skills
             .iter()
             .chain(&self.plugin_skills)
-            .filter(|s| self.in_view(s))
+            .filter(|s| self.in_view(&self.view, s))
             .filter(|s| [&s.name, &s.description, &s.source].iter().any(|f| f.to_lowercase().contains(&needle)))
             .collect();
         if self.sort_by_uses {
@@ -578,7 +782,31 @@ impl App {
             // Bulk removal only for a deliberately narrowed list, never the whole table by accident.
             let narrowed = !needle.is_empty() || !matches!(self.view, View::All | View::Plugins);
             let names: Vec<String> = rows.iter().filter(|s| !s.plugin).map(|s| s.name.clone()).collect();
-            if narrowed && !names.is_empty() {
+            if !self.checked.is_empty() {
+                // Ticked rows win over the "everything shown" shortcut.
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Clear").clicked() {
+                        self.checked.clear();
+                    }
+                    let text = format!("Remove {} selected", self.checked.len());
+                    if ui.button(RichText::new(text).color(RED)).clicked() {
+                        let mut picked: Vec<String> = self.checked.iter().cloned().collect();
+                        picked.sort();
+                        todo.push(Todo::ConfirmRemove(picked, None));
+                    }
+                });
+            } else if narrowed && !names.is_empty() {
+                let local: Vec<String> = rows.iter().filter(|s| !s.plugin && !s.tracked).map(|s| s.name.clone()).collect();
+                if !local.is_empty() {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let hover = format!("Sends the names of the {} untracked skills shown to skills.sh to see which exist there", local.len());
+                        if ui.button("Find sources on skills.sh").on_hover_text(hover).clicked() {
+                            todo.push(Todo::Lookup(local));
+                        }
+                    });
+                }
+            }
+            if self.checked.is_empty() && narrowed && !names.is_empty() {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let text = format!("Remove these {} everywhere", names.len());
                     if ui.button(RichText::new(text).color(RED)).clicked() {
@@ -599,7 +827,7 @@ impl App {
         let (head, head_resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
         let small = FontId::proportional(11.0);
         let p = ui.painter().clone();
-        p.text(head.left_center() + vec2(14.0, 0.0), Align2::LEFT_CENTER, "SKILL", small.clone(), MUTED);
+        p.text(head.left_center() + vec2(40.0, 0.0), Align2::LEFT_CENTER, "SKILL", small.clone(), MUTED);
         for (i, r) in self.env.roots.iter().enumerate() {
             p.text(egui::pos2(harness_x(head, i), head.center().y), Align2::CENTER_CENTER, r.label.to_uppercase(), small.clone(), MUTED);
         }
@@ -611,6 +839,7 @@ impl App {
             self.sort_by_uses = !self.sort_by_uses;
         }
 
+        let mut toggled = None;
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             if rows.is_empty() {
@@ -627,9 +856,21 @@ impl App {
                 }
                 ui.painter().hline(rect.x_range(), rect.bottom(), Stroke::new(1.0, Color32::from_rgb(26, 29, 34)));
 
-                let name_w = (rect.width() - fixed - 24.0).max(80.0);
-                let name_rect = Rect::from_min_size(rect.min + vec2(14.0, 6.0), vec2(name_w, 19.0));
-                let desc_rect = Rect::from_min_size(rect.min + vec2(14.0, 25.0), vec2(name_w, 17.0));
+                // Tick box in the left gutter; plugin skills cannot be removed, so they get none.
+                let box_rect = Rect::from_center_size(rect.left_center() + vec2(20.0, 0.0), vec2(15.0, 15.0));
+                let ticked = self.checked.contains(&s.name);
+                if !s.plugin {
+                    ui.painter().rect_filled(box_rect, 4.0, if ticked { ACCENT } else { Color32::TRANSPARENT });
+                    ui.painter().rect_stroke(box_rect, 4.0, Stroke::new(1.2, if ticked { ACCENT } else { MUTED }), egui::StrokeKind::Inside);
+                    if ticked {
+                        let c = box_rect.center();
+                        let tick = vec![c + vec2(-3.5, 0.0), c + vec2(-1.0, 2.8), c + vec2(3.8, -3.0)];
+                        ui.painter().add(egui::Shape::line(tick, Stroke::new(1.8, BG)));
+                    }
+                }
+                let name_w = (rect.width() - fixed - 50.0).max(80.0);
+                let name_rect = Rect::from_min_size(rect.min + vec2(40.0, 6.0), vec2(name_w, 19.0));
+                let desc_rect = Rect::from_min_size(rect.min + vec2(40.0, 25.0), vec2(name_w, 17.0));
                 let mut title = RichText::new(&s.name).size(14.5).strong().color(TEXT);
                 if !s.issues.is_empty() {
                     title = title.color(AMBER);
@@ -649,24 +890,30 @@ impl App {
                     Some((0, _)) => ui.painter().text(uses_pos, Align2::LEFT_CENTER, "never", font, AMBER),
                     Some((n, t)) => ui.painter().text(uses_pos, Align2::LEFT_CENTER, format!("{n}  ·  {}", days_ago(t)), font, TEXT),
                 };
-                text_in(ui, source_rect(rect), RichText::new(&s.source).size(12.5).color(MUTED));
+                match self.matches.get(&s.name).and_then(|m| m.first()).filter(|_| !s.tracked) {
+                    Some(top) => text_in(ui, source_rect(rect), RichText::new(format!("local, on {}", top.source)).size(12.5).color(ACCENT)),
+                    None => text_in(ui, source_rect(rect), RichText::new(&s.source).size(12.5).color(MUTED)),
+                }
 
                 if resp.clicked() {
-                    todo.push(Todo::Select(s.name.clone()));
+                    let in_gutter = resp.interact_pointer_pos().is_some_and(|p| p.x < rect.left() + 36.0);
+                    if in_gutter && !s.plugin {
+                        toggled = Some(s.name.clone());
+                    } else {
+                        todo.push(Todo::Select(s.name.clone()));
+                    }
                 }
             }
         });
+        if let Some(name) = toggled {
+            if !self.checked.remove(&name) {
+                self.checked.insert(name);
+            }
+        }
     }
 
     fn detail(&mut self, ui: &mut egui::Ui, todo: &mut Vec<Todo>) {
-        let Some(s) = self.selected.as_deref().and_then(|n| self.find(n)).cloned() else {
-            ui.add_space(80.0);
-            ui.vertical_centered(|ui| {
-                ui.label(RichText::new("No skill selected").size(16.0).color(MUTED));
-                ui.label(RichText::new("Pick one to see where it lives, fix it,\nor ask an agent whether you need it.").color(MUTED).size(12.5));
-            });
-            return;
-        };
+        let Some(s) = self.selected.as_deref().and_then(|n| self.find(n)).cloned() else { return };
         ui.add_space(4.0);
         ui.label(RichText::new(&s.name).size(21.0).strong());
         ui.horizontal_wrapped(|ui| {
@@ -697,7 +944,7 @@ impl App {
         }
 
         ui.add_space(2.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if let Some(dir) = &s.dir {
                 if ui.button("Open folder").on_hover_text(dir.display().to_string()).clicked() {
                     todo.push(Todo::Open(dir.clone()));
@@ -709,11 +956,50 @@ impl App {
             if !s.plugin && ui.button(RichText::new("Remove everywhere").color(RED)).clicked() {
                 todo.push(Todo::ConfirmRemove(vec![s.name.clone()], None));
             }
+            if !self.chat_open && ui.button("Ask an agent").clicked() {
+                self.chat_open = true;
+            }
         });
 
         if s.plugin {
-            ui.label(RichText::new("Shipped by a Claude Code plugin. Manage it with `claude plugin`.").color(MUTED).size(12.5));
-        } else {
+            let note = match s.source.strip_prefix("built into ") {
+                Some(owner) => format!("Built into {owner}, which installs and updates it itself. Read-only here so it cannot be removed by accident."),
+                None => "Shipped by a Claude Code plugin. Manage it with `claude plugin`.".to_string(),
+            };
+            ui.label(RichText::new(note).color(MUTED).size(12.5));
+        }
+        if !s.tracked && !s.plugin {
+            caption(ui, "ON SKILLS.SH");
+            match self.matches.get(&s.name) {
+                None => {
+                    ui.label(RichText::new("Not linked to a source, so it cannot update.").color(MUTED).size(12.5));
+                    if ui.button("Find on skills.sh").on_hover_text("Sends this skill's name to skills.sh").clicked() {
+                        todo.push(Todo::Lookup(vec![s.name.clone()]));
+                    }
+                }
+                Some(found) if found.is_empty() => {
+                    ui.label(RichText::new("No skill with this name there. It is yours or came from somewhere else.").color(MUTED).size(12.5));
+                }
+                Some(found) => {
+                    ui.label(RichText::new("Same name, may not be the same skill. View it before switching.").color(MUTED).size(12.5));
+                    for h in found.iter().take(4) {
+                        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
+                        let mut label_rect = rect;
+                        label_rect.max.x -= 172.0;
+                        text_in(ui, label_rect, RichText::new(format!("{}  ·  {}", h.source, compact(h.installs))).size(12.5));
+                        let mut right = ui.new_child(UiBuilder::new().max_rect(rect).layout(Layout::right_to_left(Align::Center)));
+                        let hover = "Moves your copy to the Trash, installs this one, and keeps it updating";
+                        if right.small_button("Switch to this").on_hover_text(hover).clicked() {
+                            todo.push(Todo::Track(s.name.clone(), h.source.clone()));
+                        }
+                        if right.small_button("View").clicked() {
+                            todo.push(Todo::Open(PathBuf::from(format!("https://skills.sh/{}/{}", h.source, h.skill))));
+                        }
+                    }
+                }
+            }
+        }
+        if !s.plugin {
             caption(ui, "INSTALLED IN");
             for (i, root) in self.env.roots.iter().enumerate() {
                 let entry = s.entries[i].as_ref();
@@ -744,53 +1030,185 @@ impl App {
             }
         }
 
-        caption(ui, "ASK AN AGENT");
+    }
+
+    fn market(&mut self, ui: &mut egui::Ui, todo: &mut Vec<Todo>) {
+        ui.horizontal(|ui| {
+            ui.heading("Browse skills.sh");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let go = ui.add_enabled(!self.searching, egui::Button::new("Search")).clicked();
+                let field = egui::TextEdit::singleline(&mut self.market_q).hint_text("Search the skills.sh directory").desired_width(320.0);
+                if go || (ui.add(field).lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                    todo.push(Todo::Search);
+                }
+            });
+        });
+        let note = "The public directory behind `npx skills`. Install runs: npx skills add <source> -s <skill> -g -y";
+        ui.label(RichText::new(note).size(12.0).color(MUTED));
+        ui.add_space(4.0);
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            if self.hits.is_empty() {
+                let hint = match (self.searching, self.searched) {
+                    (true, _) => "Searching...",
+                    (_, true) => "Nothing found.",
+                    _ => "Search by what the skill should do: react, pdf, testing, seo.",
+                };
+                ui.add_space(40.0);
+                ui.vertical_centered(|ui| ui.label(RichText::new(hint).color(MUTED)));
+            }
+            for h in &self.hits {
+                let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::hover());
+                ui.painter().hline(rect.x_range(), rect.bottom(), Stroke::new(1.0, Color32::from_rgb(26, 29, 34)));
+                let name_w = (rect.width() - 330.0).max(80.0);
+                text_in(ui, Rect::from_min_size(rect.min + vec2(14.0, 6.0), vec2(name_w, 19.0)), RichText::new(&h.name).size(14.5).strong());
+                text_in(ui, Rect::from_min_size(rect.min + vec2(14.0, 25.0), vec2(name_w, 17.0)), RichText::new(&h.source).size(12.0).color(MUTED));
+                ui.painter().text(
+                    rect.right_center() - vec2(180.0, 0.0),
+                    Align2::RIGHT_CENTER,
+                    format!("{} installs", compact(h.installs)),
+                    FontId::proportional(12.5),
+                    MUTED,
+                );
+                let mut right = ui.new_child(UiBuilder::new().max_rect(rect.shrink2(vec2(10.0, 0.0))).layout(Layout::right_to_left(Align::Center)));
+                if self.skills.iter().any(|s| s.name == h.name) {
+                    right.label(RichText::new("installed").color(GREEN).size(12.5));
+                } else if right.button("Install").clicked() {
+                    todo.push(Todo::Install(h.source.clone(), h.skill.clone()));
+                }
+                if right.small_button("View").on_hover_text("Open its page on skills.sh").clicked() {
+                    todo.push(Todo::Open(PathBuf::from(format!("https://skills.sh/{}/{}", h.source, h.skill))));
+                }
+            }
+        });
+    }
+
+    fn chat(&mut self, ui: &mut egui::Ui, todo: &mut Vec<Todo>) {
+        let key = self.selected.clone().filter(|n| self.find(n).is_some()).unwrap_or_default();
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Ask an agent").size(18.0).strong());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("Hide").clicked() {
+                    self.chat_open = false;
+                }
+            });
+        });
+        let about = if key.is_empty() { "About your whole library. Select a skill to ask about just that one.".into() } else { format!("About {key}") };
+        ui.label(RichText::new(about).size(12.5).color(MUTED));
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
             for (i, a) in AGENTS.iter().enumerate() {
                 ui.selectable_value(&mut self.agent, i, *a);
             }
         });
-        let waiting = self.asking.is_some();
-        let chat_h = (ui.available_height() - 104.0).max(60.0);
-        egui::ScrollArea::vertical().id_salt("chat").max_height(chat_h).auto_shrink(false).stick_to_bottom(true).show(ui, |ui| {
-            for (who, text) in self.chats.get(&s.name).into_iter().flatten() {
-                let mine = *who == "you";
-                if !mine {
-                    ui.label(RichText::new(*who).size(11.5).color(MUTED));
-                }
-                egui::Frame::new()
-                    .fill(if mine { SELECTED } else { CARD })
-                    .corner_radius(CornerRadius::same(10))
-                    .inner_margin(Margin::same(10))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.add(Label::new(RichText::new(text).size(13.5)).wrap().selectable(true));
-                    });
-                ui.add_space(4.0);
-            }
-            if waiting {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(RichText::new(format!("{} is thinking...", AGENTS[self.agent])).color(MUTED).size(12.5));
+        let a = self.agent;
+        let levels = self.levels(a);
+        ui.horizontal(|ui| {
+            let half = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+            let (list, model, effort, filter) = (&self.model_lists[a], &mut self.models[a], &mut self.efforts[a], &mut self.model_filter);
+            let shown = if model.is_empty() { "Default model".to_string() } else { model.clone() };
+            egui::ComboBox::from_id_salt(("model", a))
+                .selected_text(shown)
+                .width(half)
+                .height(380.0)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show_ui(ui, |ui| {
+                    // Long catalogs (opencode lists hundreds) get a filter box.
+                    if list.len() > 12 {
+                        ui.add(egui::TextEdit::singleline(filter).hint_text("Filter").desired_width(f32::INFINITY));
+                    }
+                    let needle = filter.to_lowercase();
+                    let mut pick = None;
+                    if ui.selectable_label(model.is_empty(), "Default model").clicked() {
+                        pick = Some(String::new());
+                    }
+                    for (m, _) in list.iter().filter(|(m, _)| list.len() <= 12 || m.to_lowercase().contains(&needle)) {
+                        if ui.selectable_label(m == model, m).clicked() {
+                            pick = Some(m.clone());
+                        }
+                    }
+                    if let Some(m) = pick {
+                        *model = m;
+                        effort.clear();
+                        ui.close();
+                    }
                 });
-            }
+            let shown = if effort.is_empty() { "Default thinking".to_string() } else { format!("Thinking: {effort}") };
+            egui::ComboBox::from_id_salt(("effort", a)).selected_text(shown).width(half).show_ui(ui, |ui| {
+                ui.selectable_value(effort, String::new(), "Default thinking");
+                for l in &levels {
+                    ui.selectable_value(effort, l.clone(), l);
+                }
+            });
         });
-        ui.add(
-            egui::TextEdit::multiline(&mut self.question)
-                .hint_text("Ask about this skill")
-                .desired_rows(2)
-                .desired_width(f32::INFINITY),
-        );
-        let ready = !waiting && !self.question.trim().is_empty();
-        if ui.add_enabled(ready, egui::Button::new(format!("Ask {}", AGENTS[self.agent]))).clicked() {
-            todo.push(Todo::Ask(s.name.clone()));
-        }
+        ui.add_space(2.0);
+
+        let waiting = self.asking.is_some();
+        // Bottom-up so the question box stays pinned and the conversation takes whatever is left.
+        ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
+            let ready = !waiting && !self.question.trim().is_empty();
+            let button = egui::Button::new(format!("Ask {}", AGENTS[a])).min_size(vec2(ui.available_width(), 30.0));
+            let send = ui.add_enabled(ready, button).clicked();
+            let field = ui.add(
+                egui::TextEdit::multiline(&mut self.question)
+                    .hint_text("Do I still need this? Does it overlap with another skill?  (Enter sends)")
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY)
+                    .return_key(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::Enter)),
+            );
+            let entered = field.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+            if ready && (send || entered) {
+                todo.push(Todo::Ask(key.clone()));
+            }
+            ui.add_space(4.0);
+            ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                egui::ScrollArea::vertical().id_salt("chat").auto_shrink(false).stick_to_bottom(true).show(ui, |ui| {
+                    let msgs = self.chats.get(&key).map(Vec::as_slice).unwrap_or_default();
+                    if msgs.is_empty() && !waiting {
+                        ui.add_space(30.0);
+                        ui.vertical_centered(|ui| ui.label(RichText::new("Ask whether to keep, merge or remove.\nThe agent sees the skill and the rest of your library.").color(MUTED).size(12.5)));
+                    }
+                    for (who, text) in msgs {
+                        let mine = *who == "you";
+                        if !mine {
+                            ui.label(RichText::new(*who).size(11.5).color(MUTED));
+                        }
+                        // Your messages sit to the right, the agent's to the left.
+                        let gap = if mine { Margin { left: 48, ..Margin::ZERO } } else { Margin { right: 20, ..Margin::ZERO } };
+                        egui::Frame::new()
+                            .fill(if mine { SELECTED } else { CARD })
+                            .corner_radius(CornerRadius::same(11))
+                            .inner_margin(Margin::symmetric(12, 9))
+                            .outer_margin(gap)
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.add(Label::new(RichText::new(text).size(14.0)).wrap().selectable(true));
+                            });
+                        ui.add_space(6.0);
+                    }
+                    if waiting {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(RichText::new(format!("{} is thinking...", AGENTS[a])).color(MUTED).size(12.5));
+                        });
+                    }
+                });
+            });
+        });
     }
 
-    fn status(&mut self, ui: &mut egui::Ui) {
+    fn status(&mut self, ui: &mut egui::Ui, todo: &mut Vec<Todo>) {
         ui.horizontal(|ui| {
             if self.busy > 0 {
                 ui.spinner();
+            }
+            if self.updating {
+                ui.label(RichText::new("Downloading update...").size(12.5).color(ACCENT));
+            } else if let Some((v, _)) = &self.update {
+                if ui.small_button(RichText::new(format!("Update to {v} and restart")).color(ACCENT)).clicked() {
+                    todo.push(Todo::InstallUpdate);
+                }
             }
             let last = self.log.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
             // CLI output leads with box-drawing glyphs the UI font cannot draw.
@@ -822,12 +1240,22 @@ impl eframe::App for App {
 
         egui::Panel::bottom("status")
             .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(14, 7)))
-            .show(ui, |ui| self.status(ui));
+            .show(ui, |ui| self.status(ui, &mut todo));
         egui::Panel::left("nav").frame(side).resizable(false).default_size(220.0).show(ui, |ui| self.nav(ui, &mut todo));
-        egui::Panel::right("detail").frame(side).resizable(true).default_size(400.0).show(ui, |ui| self.detail(ui, &mut todo));
+        // Added first so it sits outermost: skills | details | chat.
+        if self.chat_open {
+            egui::Panel::right("chat").frame(side).resizable(true).default_size(340.0).show(ui, |ui| self.chat(ui, &mut todo));
+        }
+        // No selection, no panel: the list gets the room instead.
+        if self.selected.as_deref().is_some_and(|n| self.find(n).is_some()) {
+            egui::Panel::right("detail").frame(side).resizable(true).default_size(330.0).show(ui, |ui| self.detail(ui, &mut todo));
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG).inner_margin(Margin::same(16)))
-            .show(ui, |ui| self.table(ui, &mut todo));
+            .show(ui, |ui| match self.view {
+                View::Discover => self.market(ui, &mut todo),
+                _ => self.table(ui, &mut todo),
+            });
 
         if let Some((names, only)) = self.confirm.clone() {
             let what = match names.as_slice() {

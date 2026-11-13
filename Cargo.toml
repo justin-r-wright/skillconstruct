@@ -1,6 +1,6 @@
 [package]
 name = "skillconstruct"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A desktop app for managing agent skills across Claude Code, Codex, Cursor and opencode"
 license = "MIT"

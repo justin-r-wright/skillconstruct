@@ -65,7 +65,7 @@ pub struct Skill {
     pub source: String,
     /// In ~/.agents/.skill-lock.json, so `npx skills update` can refresh it.
     pub tracked: bool,
-    /// Comes from a Claude Code plugin: shown read-only.
+    /// Owned by something else (a Claude Code plugin, or built into a harness): shown read-only.
     pub plugin: bool,
     pub issues: Vec<String>,
     pub dir: Option<PathBuf>,
@@ -199,7 +199,8 @@ pub fn scan(env: &Env) -> Vec<Skill> {
     map.into_values().collect()
 }
 
-/// Skills shipped inside installed Claude Code plugins. Read-only: `claude plugin` owns them.
+/// Skills this app must not touch: shipped inside Claude Code plugins, or built into a harness
+/// that maintains (and restores) them itself. Shown read-only.
 pub fn plugin_skills(env: &Env) -> Vec<Skill> {
     let v: serde_json::Value = fs::read_to_string(env.home.join(".claude/plugins/installed_plugins.json"))
         .ok()
@@ -217,6 +218,26 @@ pub fn plugin_skills(env: &Env) -> Vec<Skill> {
                 description: parse_frontmatter(&md).remove("description").unwrap_or_default(),
                 entries: vec![None; env.roots.len()],
                 source: format!("plugin {key}"),
+                plugin: true,
+                dir: Some(e.path()),
+                ..Default::default()
+            });
+        }
+    }
+    // Where Codex and Cursor keep the skills they ship and update themselves.
+    for (label, sub) in [("codex", ".codex/skills/.system"), ("cursor", ".cursor/skills-cursor")] {
+        let Ok(rd) = fs::read_dir(env.home.join(sub)) else { continue };
+        for e in rd.flatten() {
+            let Ok(md) = fs::read_to_string(e.path().join("SKILL.md")) else { continue };
+            let mut entries = vec![None; env.roots.len()];
+            if let Some(i) = env.roots.iter().position(|r| r.label == label) {
+                entries[i] = Some(Entry { kind: Kind::Dir, real: Some(e.path()) });
+            }
+            out.push(Skill {
+                name: format!("{label}:{}", e.file_name().to_string_lossy()),
+                description: parse_frontmatter(&md).remove("description").unwrap_or_default(),
+                entries,
+                source: format!("built into {label}"),
                 plugin: true,
                 dir: Some(e.path()),
                 ..Default::default()
@@ -266,7 +287,8 @@ pub fn remove(env: &Env, name: &str, only: Option<usize>) -> Result<(), String> 
         } else if p.is_dir() {
             let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
             fs::create_dir_all(&env.trash).map_err(err)?;
-            fs::rename(&p, env.trash.join(format!("{name}-{ts}")))
+            // The harness label keeps two real copies of one skill from colliding in the Trash.
+            fs::rename(&p, env.trash.join(format!("{name}-{}-{ts}", env.roots[i].label)))
                 .map_err(|e| format!("could not move {} to Trash: {e}", p.display()))?;
         }
     }
@@ -448,6 +470,16 @@ mod tests {
         assert!(add_local(&env, &src).is_err());
 
         let _ = fs::remove_dir_all(&env.home);
+    }
+
+    #[test]
+    fn remove_two_real_copies() {
+        let env = fake_home("twocopies");
+        write_skill(&env.roots[1].dir.join("dup"), "---\nname: dup\ndescription: a\n---\n");
+        write_skill(&env.roots[2].dir.join("dup"), "---\nname: dup\ndescription: b\n---\n");
+        remove(&env, "dup", None).unwrap();
+        assert!(scan(&env).is_empty());
+        assert_eq!(fs::read_dir(&env.trash).unwrap().count(), 2);
     }
 
     #[test]
