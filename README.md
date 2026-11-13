@@ -40,7 +40,11 @@ Skill Construct is the loading room where you sort that out.
 - **Find dead weight.** Counts how often each skill was used in your Claude Code and Codex
   transcripts and lets you sort by least used.
 - **Clean up fast.** Remove one skill, a hand-ticked few, or everything from one source, in two clicks.
+  A select-all box ticks everything shown so you can untick the keepers.
   Real folders go to the Trash, never straight to deletion.
+- **See what depends on what.** Each skill has a Dependencies section listing the skills it depends on
+  and the skills that need it, and removal warns when a skill you are keeping refers to one you are removing.
+  This is read from the text of each `SKILL.md`, so treat it as a hint, not a guarantee.
 - **Share across agents.** Link a skill into any harness that lacks it, or unlink it from one.
 - **Add and update.** Add from a local folder, `owner/repo` or a URL; update one skill or all of them.
 - **Browse skills.sh.** Search the public [skills.sh](https://skills.sh) directory and install

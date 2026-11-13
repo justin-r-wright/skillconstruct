@@ -71,6 +71,10 @@ pub struct Skill {
     pub dir: Option<PathBuf>,
     /// The skill really lives here, outside every skill folder: something else put it there and owns it.
     pub outside: Option<PathBuf>,
+    /// Other installed skills this one's SKILL.md mentions, so removing them may break it.
+    pub needs: Vec<String>,
+    /// The reverse: skills whose SKILL.md mentions this one.
+    pub needed_by: Vec<String>,
 }
 
 impl Skill {
@@ -206,6 +210,29 @@ pub fn scan(env: &Env) -> Vec<Skill> {
         };
     }
     map.into_values().collect()
+}
+
+/// Whether `text` refers to the skill `name`, not just a word that happens to match.
+/// ponytail: a text heuristic, not a declared dependency. Hyphenated names count wherever they stand
+/// alone; plain words like "research" only when written as `name`, /name, $name or "name skill".
+/// Read a `requires:` frontmatter key instead if the skill format ever gets one.
+pub fn mentions(text: &str, name: &str) -> bool {
+    let part = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    text.match_indices(name).any(|(i, _)| {
+        let before = text[..i].chars().next_back();
+        let after = &text[i + name.len()..];
+        let alone = !before.is_some_and(part) && !after.chars().next().is_some_and(part);
+        let marked = before.is_some_and(|c| "`/$".contains(c)) || after.get(..6).is_some_and(|a| a.eq_ignore_ascii_case(" skill"));
+        alone && (name.contains('-') || marked)
+    })
+}
+
+/// Fills in `needs` for every skill in `all` from the removable skills named in `targets`.
+pub fn link_needs(all: &mut [Skill], targets: &[String]) {
+    for s in all.iter_mut() {
+        let Some(md) = s.dir.as_ref().and_then(|d| fs::read_to_string(d.join("SKILL.md")).ok()) else { continue };
+        s.needs = targets.iter().filter(|t| **t != s.name && mentions(&md, t)).cloned().collect();
+    }
 }
 
 /// `p` with the home folder shortened to `~`.
@@ -581,5 +608,24 @@ mod tests {
         assert_eq!(similarity("a\nb\n", " a\n\nb"), 100);
         assert_eq!(similarity("a\nb", "a\nc"), 33);
         assert_eq!(similarity("a", "b"), 0);
+    }
+
+    #[test]
+    fn needs() {
+        assert!(mentions("then run the watch-pr skill", "watch-pr"));
+        assert!(!mentions("use ship-and-watch-pr here", "watch-pr"));
+        assert!(!mentions("do some research first", "research"));
+        assert!(mentions("load `research` first", "research"));
+        assert!(mentions("use the research skill", "research"));
+        assert!(mentions("type /tdd to start", "tdd"));
+
+        let env = fake_home("needs");
+        write_skill(&env.roots[0].dir.join("ship"), "---\nname: ship\ndescription: d\n---\nUses the watch-pr skill.\n");
+        write_skill(&env.roots[0].dir.join("watch-pr"), "---\nname: watch-pr\ndescription: d\n---\n");
+        let mut skills = scan(&env);
+        let names: Vec<String> = skills.iter().map(|s| s.name.clone()).collect();
+        link_needs(&mut skills, &names);
+        assert_eq!(skills.iter().find(|s| s.name == "ship").unwrap().needs, ["watch-pr"]);
+        assert!(skills.iter().find(|s| s.name == "watch-pr").unwrap().needs.is_empty());
     }
 }

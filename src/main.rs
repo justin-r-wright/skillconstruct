@@ -425,6 +425,14 @@ impl App {
     fn rescan(&mut self) {
         self.skills = core::scan(&self.env);
         self.plugin_skills = core::plugin_skills(&self.env);
+        let names: Vec<String> = self.skills.iter().map(|s| s.name.clone()).collect();
+        core::link_needs(&mut self.skills, &names);
+        core::link_needs(&mut self.plugin_skills, &names);
+        let pairs: Vec<(String, String)> =
+            self.skills.iter().chain(&self.plugin_skills).flat_map(|s| s.needs.iter().map(|n| (n.clone(), s.name.clone()))).collect();
+        for s in &mut self.skills {
+            s.needed_by = pairs.iter().filter(|(needed, _)| *needed == s.name).map(|(_, by)| by.clone()).collect();
+        }
         self.checked.retain(|n| self.skills.iter().any(|s| &s.name == n));
     }
 
@@ -884,6 +892,21 @@ impl App {
         let small = FontId::proportional(11.0);
         let p = ui.painter().clone();
         p.text(head.left_center() + vec2(40.0, 0.0), Align2::LEFT_CENTER, "SKILL", small.clone(), MUTED);
+        // Select-all box above the row tick boxes: ticks everything shown, then untick as needed.
+        let shown: Vec<&String> = rows.iter().filter(|s| !s.plugin).map(|s| &s.name).collect();
+        let all = !shown.is_empty() && shown.iter().all(|n| self.checked.contains(*n));
+        let some = shown.iter().any(|n| self.checked.contains(*n));
+        if !shown.is_empty() {
+            let b = Rect::from_center_size(head.left_center() + vec2(20.0, 0.0), vec2(15.0, 15.0));
+            p.rect_filled(b, 4.0, if some { ACCENT } else { Color32::TRANSPARENT });
+            p.rect_stroke(b, 4.0, Stroke::new(1.2, if some { ACCENT } else { MUTED }), egui::StrokeKind::Inside);
+            let c = b.center();
+            if all {
+                p.add(egui::Shape::line(vec![c + vec2(-3.5, 0.0), c + vec2(-1.0, 2.8), c + vec2(3.8, -3.0)], Stroke::new(1.8, BG)));
+            } else if some {
+                p.hline((c.x - 3.5)..=(c.x + 3.5), c.y, Stroke::new(1.8, BG));
+            }
+        }
         for (i, r) in self.env.roots.iter().enumerate() {
             p.text(egui::pos2(harness_x(head, i), head.center().y), Align2::CENTER_CENTER, r.label.to_uppercase(), small.clone(), MUTED);
         }
@@ -891,7 +914,14 @@ impl App {
         p.text(egui::pos2(uses_x(head), head.center().y), Align2::LEFT_CENTER, uses_head, small.clone(), if self.sort_by_uses { ACCENT } else { MUTED });
         p.text(source_rect(head).left_center(), Align2::LEFT_CENTER, "SOURCE", small, MUTED);
         p.hline(head.x_range(), head.bottom(), Stroke::new(1.0, BORDER));
-        if head_resp.on_hover_text("Click to sort by least used").clicked() {
+        let on_box = head_resp.interact_pointer_pos().is_some_and(|pos| pos.x < head.left() + 36.0);
+        if head_resp.clicked() && on_box {
+            let shown: Vec<String> = shown.into_iter().cloned().collect();
+            match all {
+                true => self.checked.retain(|n| !shown.contains(n)),
+                false => self.checked.extend(shown),
+            }
+        } else if head_resp.on_hover_text("Tick the box to select everything shown. Click elsewhere to sort by least used.").clicked() {
             self.sort_by_uses = !self.sort_by_uses;
         }
 
@@ -932,7 +962,10 @@ impl App {
                     title = title.color(AMBER);
                 }
                 text_in(ui, name_rect, title);
-                let desc = if s.issues.is_empty() { s.description.clone() } else { s.issues.join("  |  ") };
+                let mut desc = if s.issues.is_empty() { s.description.clone() } else { s.issues.join("  |  ") };
+                if !s.needed_by.is_empty() {
+                    desc = format!("needed by {}  ·  {desc}", s.needed_by.len());
+                }
                 text_in(ui, desc_rect, RichText::new(desc).size(12.0).color(MUTED));
 
                 for (i, e) in s.entries.iter().enumerate() {
@@ -1067,6 +1100,26 @@ impl App {
                     }
                 }
             }
+        }
+        if !s.needs.is_empty() || !s.needed_by.is_empty() {
+            caption(ui, "DEPENDENCIES");
+            for (label, list, hover) in [
+                ("Depends on", &s.needs, "This skill's SKILL.md mentions it. Removing it may break this skill."),
+                ("Needed by", &s.needed_by, "Its SKILL.md mentions this skill. Removing this skill may break it."),
+            ] {
+                if list.is_empty() {
+                    continue;
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(label).color(MUTED).size(12.5));
+                    for n in list {
+                        if ui.small_button(n).on_hover_text(hover).clicked() {
+                            todo.push(Todo::Select(n.clone()));
+                        }
+                    }
+                });
+            }
+            ui.label(RichText::new("Read from the text of each SKILL.md, so treat it as a hint.").color(MUTED).size(11.5));
         }
         if !s.plugin {
             caption(ui, "INSTALLED IN");
@@ -1384,6 +1437,27 @@ impl eframe::App for App {
                     ui.label(RichText::new(format!("Remove {what} from {scope}?")).size(16.0).strong());
                     if names.len() > 1 {
                         ui.label(RichText::new(names.join(", ")).size(13.0));
+                    }
+                    // Skills that stay behind but mention one being removed.
+                    let hurt: Vec<String> = self
+                        .skills
+                        .iter()
+                        .chain(&self.plugin_skills)
+                        .filter(|s| !names.contains(&s.name))
+                        .filter_map(|s| {
+                            let lost: Vec<&str> = s.needs.iter().filter(|n| names.contains(n)).map(String::as_str).collect();
+                            (!lost.is_empty()).then(|| format!("{} depends on {}", s.name, lost.join(", ")))
+                        })
+                        .collect();
+                    if !hurt.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("Skills you are keeping that refer to these and may stop working:").color(AMBER).size(13.0).strong());
+                        egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                            for h in &hurt {
+                                ui.label(RichText::new(h).color(AMBER).size(12.5));
+                            }
+                        });
+                        ui.add_space(4.0);
                     }
                     ui.label(
                         RichText::new("Real folders go to the Trash. Links that pointed at a trashed copy are removed too.")
